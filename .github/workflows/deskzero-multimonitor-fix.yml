@@ -1,0 +1,104 @@
+name: Build DeskZero Multi-Monitor Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Apply multi-monitor coordinate fix
+        shell: pwsh
+        run: |
+          $script = @'
+          from pathlib import Path
+
+          file = Path('src-tauri/src/lib.rs')
+          src = file.read_text(encoding='utf-8')
+
+          def replace_exact(old, new, expected=1):
+              global src
+              count = src.count(old)
+              if count != expected:
+                  raise SystemExit(f'Patch stopped: expected {expected} occurrence(s), found {count}: {old[:90]!r}')
+              src = src.replace(old, new)
+
+          replace_exact(
+              '    pub type HWND = *mut c_void;\n',
+              '    pub type HWND = *mut c_void;\n'
+              '    #[repr(C)]\n'
+              '    struct POINT { x: i32, y: i32 }\n'
+          )
+          replace_exact(
+              '        fn GetParent(hWnd: HWND) -> HWND;\n',
+              '        fn GetParent(hWnd: HWND) -> HWND;\n'
+              '        fn MapWindowPoints(from: HWND, to: HWND, points: *mut POINT, count: u32) -> i32;\n'
+          )
+          replace_exact(
+              '    const SWP_SHOWWINDOW: UINT = 0x0040;\n',
+              '    fn virtual_origin_in_parent(hwnd: isize, x: i32, y: i32) -> (i32, i32) {\n'
+              '        unsafe {\n'
+              '            let parent = GetParent(hwnd as HWND);\n'
+              '            if parent.is_null() { return (x, y); }\n'
+              '            let mut p = POINT { x, y };\n'
+              '            MapWindowPoints(std::ptr::null_mut(), parent, &mut p, 1);\n'
+              '            (p.x, p.y)\n'
+              '        }\n'
+              '    }\n'
+              '    const SWP_SHOWWINDOW: UINT = 0x0040;\n'
+          )
+          marker = '            let v_height = GetSystemMetrics(sm_cyvirtualscreen);\n'
+          replace_exact(marker, marker + '            let (local_x, local_y) = virtual_origin_in_parent(hwnd, v_x, v_y);\n', 2)
+          replace_exact(
+              '                    v_x, v_y, v_width, v_height,\n',
+              '                    local_x, local_y, v_width, v_height,\n'
+          )
+          replace_exact(
+              '                v_x,\n                v_y,\n                v_width,\n',
+              '                local_x,\n                local_y,\n                v_width,\n'
+          )
+          file.write_text(src, encoding='utf-8')
+          print('Applied parent-client coordinate conversion to both window sizing functions.')
+          '@
+          $scriptPath = Join-Path $env:RUNNER_TEMP 'patch_deskzero.py'
+          Set-Content -Path $scriptPath -Value $script -Encoding utf8
+          python $scriptPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff -- src-tauri/src/lib.rs
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Sync application version
+        run: node scripts/sync-config.js
+
+      - name: Build Windows executable
+        run: npm run tauri build -- --no-bundle
+
+      - name: Upload patched EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskZero-MultiMonitor-Fix-Windows-x64
+          path: src-tauri/target/release/deskzero.exe
+          if-no-files-found: error
+          retention-days: 14
