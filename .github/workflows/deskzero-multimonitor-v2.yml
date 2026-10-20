@@ -1,0 +1,121 @@
+name: Build DeskZero Multi-Monitor V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Patch desktop embedding geometry
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p = Path('src-tauri/src/lib.rs')
+          s = p.read_text(encoding='utf-8')
+          def sub(old, new, count=1):
+              global s
+              actual=s.count(old)
+              if actual != count: raise SystemExit(f'Patch mismatch: expected {count}, got {actual}: {old[:100]!r}')
+              s=s.replace(old,new)
+          # Fullscreen is a monitor-scoped window state and can interfere with reparented sizing.
+          sub('                    let _ = window_clone.set_fullscreen(true);',
+              '                    let _ = window_clone.set_fullscreen(false); // V2: do not enter monitor-scoped fullscreen')
+          sub('        fn GetParent(hWnd: HWND) -> HWND;',
+              '        fn GetParent(hWnd: HWND) -> HWND;\n'
+              '        fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;\n'
+              '        fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> BOOL;')
+          sub('    pub type HWND = *mut c_void;',
+              '    pub type HWND = *mut c_void;\n'
+              '    #[repr(C)]\n'
+              '    struct POINT { x: i32, y: i32 }')
+          anchor='    const SWP_SHOWWINDOW: UINT = 0x0040;'
+          helper='''    // Position child window in parent-client coordinates and verify actual screen bounds.
+              fn place_virtual_desktop(hwnd: isize, width: i32, height: i32, screen_x: i32, screen_y: i32) {
+                  unsafe {
+                      let parent = GetParent(hwnd as HWND);
+                      let mut origin = POINT { x: 0, y: 0 };
+                      if !parent.is_null() { ClientToScreen(parent, &mut origin); }
+                      let mut px = screen_x - origin.x;
+                      let mut py = screen_y - origin.y;
+                      // SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+                      let flags: UINT = 0x0004 | 0x0010 | 0x0020;
+                      for attempt in 0..3 {
+                          let ok = SetWindowPos(hwnd as HWND, std::ptr::null_mut(), px, py, width, height, flags);
+                          let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                          let rect_ok = GetWindowRect(hwnd as HWND, &mut rect);
+                          eprintln!("[DeskZero-V2] geometry attempt={} set={} get={} wanted=({}, {}) actual=({}, {}) parentOrigin=({}, {}) size={}x{}", attempt, ok, rect_ok, screen_x, screen_y, rect.left, rect.top, origin.x, origin.y, rect.right-rect.left, rect.bottom-rect.top);
+                          if rect_ok == 0 { break; }
+                          let dx = screen_x - rect.left;
+                          let dy = screen_y - rect.top;
+                          if dx == 0 && dy == 0 { break; }
+                          px += dx;
+                          py += dy;
+                      }
+                  }
+              }
+          '''
+          sub(anchor,helper+anchor)
+          sub('''                SetWindowPos(
+                              hwnd as HWND,
+                              0 as HWND,
+                              v_x, v_y, v_width, v_height,
+                              0x0020, // SWP_FRAMECHANGED - 触发 WM_NCCALCSIZE 消除白边
+                          );''',
+              '''                place_virtual_desktop(hwnd, v_width, v_height, v_x, v_y);''') if False else None
+          # Replace exact function calls with their original indentation, checking occurrence.
+          sub('''                SetWindowPos(
+                      hwnd as HWND,
+                      0 as HWND,
+                      v_x, v_y, v_width, v_height,
+                      0x0020, // SWP_FRAMECHANGED - 触发 WM_NCCALCSIZE 消除白边
+                  );''',
+              '''                place_virtual_desktop(hwnd, v_width, v_height, v_x, v_y);''')
+          sub('''            SetWindowPos(
+                  hwnd as HWND,
+                  HWND_TOP as HWND,
+                  v_x,
+                  v_y,
+                  v_width,
+                  v_height,
+                  swp_framechanged,
+              );''',
+              '''            place_virtual_desktop(hwnd, v_width, v_height, v_x, v_y);''')
+          p.write_text(s, encoding='utf-8')
+          print('V2 geometry patch applied')
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\patch_v2.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\patch_v2.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff -- src-tauri/src/lib.rs
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Sync application version
+        run: node scripts/sync-config.js
+      - name: Build Windows executable
+        run: npm run tauri build -- --no-bundle
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskZero-MultiMonitor-V2-Windows-x64
+          path: src-tauri/target/release/deskzero.exe
+          if-no-files-found: error
+          retention-days: 14
