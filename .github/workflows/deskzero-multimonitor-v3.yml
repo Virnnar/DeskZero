@@ -1,0 +1,120 @@
+name: Build DeskZero Multi-Monitor V3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Patch desktop coordinates (V3)
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          path = Path('src-tauri/src/lib.rs')
+          src = path.read_text(encoding='utf-8')
+
+          def replace_once(pattern, replacement, label, flags=0):
+              global src
+              src, n = re.subn(pattern, replacement, src, count=0, flags=flags)
+              print(f'{label}: matched {n}')
+              if n != 1:
+                  raise SystemExit(f'ERROR: {label} must match once; matched {n}')
+
+          replace_once(
+              r'let\s+_\s*=\s*window_clone\.set_fullscreen\(true\);',
+              'let _ = window_clone.set_fullscreen(false); // V3: no monitor-scoped fullscreen',
+              'Disable fullscreen at startup'
+          )
+
+          replace_once(
+              r'(?m)^(\s*fn GetParent\(hWnd: HWND\) -> HWND;)',
+              r'\1\n        fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;\n        fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> BOOL;',
+              'Add Win32 coordinate APIs'
+          )
+
+          replace_once(
+              r'(?m)^(\s*pub type HWND = \*mut c_void;)',
+              r'\1\n    #[repr(C)]\n    struct POINT { x: i32, y: i32 }',
+              'Add POINT type'
+          )
+
+          helper = '''    // Coordinates passed to SetWindowPos for a child are parent-client relative.
+              fn place_virtual_desktop(hwnd: isize, width: i32, height: i32, screen_x: i32, screen_y: i32) {
+                  unsafe {
+                      let parent = GetParent(hwnd as HWND);
+                      let mut origin = POINT { x: 0, y: 0 };
+                      if !parent.is_null() { ClientToScreen(parent, &mut origin); }
+                      let mut x = screen_x - origin.x;
+                      let mut y = screen_y - origin.y;
+                      let flags: UINT = 0x0004 | 0x0010 | 0x0020; // SWP_NOZORDER | NOACTIVATE | FRAMECHANGED
+                      for attempt in 0..3 {
+                          let ok = SetWindowPos(hwnd as HWND, std::ptr::null_mut(), x, y, width, height, flags);
+                          let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                          let got = GetWindowRect(hwnd as HWND, &mut rect);
+                          eprintln!("[DeskZero-V3] attempt={} set={} got={} wanted=({}, {}) actual=({}, {}) parentOrigin=({}, {})", attempt, ok, got, screen_x, screen_y, rect.left, rect.top, origin.x, origin.y);
+                          if got == 0 || (rect.left == screen_x && rect.top == screen_y) { break; }
+                          x += screen_x - rect.left;
+                          y += screen_y - rect.top;
+                      }
+                  }
+              }
+          '''
+          if src.count('    const SWP_SHOWWINDOW: UINT = 0x0040;') != 1:
+              raise SystemExit('Cannot locate Win32 constants for helper insertion')
+          src = src.replace('    const SWP_SHOWWINDOW: UINT = 0x0040;', helper + '    const SWP_SHOWWINDOW: UINT = 0x0040;')
+
+          # Match by call arguments, not indentation or the Chinese inline comment.
+          call_pattern = (
+              r'SetWindowPos\(\s*hwnd as HWND,\s*'
+              r'(?:0 as HWND|HWND_TOP as HWND),\s*'
+              r'v_x,\s*v_y,\s*v_width,\s*v_height,\s*'
+              r'(?:0x0020,\s*(?://[^\n]*\n\s*)?|swp_framechanged,\s*)'
+              r'\);'
+          )
+          src, n = re.subn(call_pattern,
+              'place_virtual_desktop(hwnd, v_width, v_height, v_x, v_y);', src)
+          print(f'Replace desktop placement calls: matched {n}')
+          if n != 2:
+              raise SystemExit(f'ERROR: expected two placement calls, matched {n}')
+
+          path.write_text(src, encoding='utf-8')
+          print('V3 patch applied; source is ready for compilation')
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\deskzero_v3_patch.py" -Encoding utf8
+          python "$env:RUNNER_TEMP\deskzero_v3_patch.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff -- src-tauri/src/lib.rs
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Sync application version
+        run: node scripts/sync-config.js
+      - name: Build Windows executable
+        run: npm run tauri build -- --no-bundle
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskZero-MultiMonitor-V3-Windows-x64
+          path: src-tauri/target/release/deskzero.exe
+          if-no-files-found: error
+          retention-days: 14
