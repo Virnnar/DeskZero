@@ -1,0 +1,298 @@
+name: Build DeskZero Mixed-DPI V6 (Frontend Coordinates)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    - name: Apply parent-aware physical-coordinate patch (experimental)
+      shell: pwsh
+      run: |
+        @'
+        from pathlib import Path
+        import re
+
+        lib_path = Path('src-tauri/src/lib.rs')
+        scan_path = Path('src-tauri/src/desktop/monitor_scanner.rs')
+        lib = lib_path.read_text(encoding='utf-8')
+        scan = scan_path.read_text(encoding='utf-8')
+
+        def replace_exact(src, old, new, count, label):
+            actual = src.count(old)
+            print(f'{label}: {actual} match(es), expected {count}')
+            if actual != count:
+                raise SystemExit(f'Patch aborted: {label}; source differs from expected upstream. No files written.')
+            return src.replace(old, new)
+
+        lib = replace_exact(
+            lib,
+            'let _ = window_clone.set_fullscreen(true);',
+            'let _ = window_clone.set_fullscreen(false); // V5: embedded child is not a fullscreen top-level window',
+            1, 'Disable Tauri fullscreen')
+
+        lib = replace_exact(
+            lib,
+            '        fn GetParent(hWnd: HWND) -> HWND;',
+            '        fn GetParent(hWnd: HWND) -> HWND;\n'
+            '        fn GetAncestor(hWnd: HWND, flags: UINT) -> HWND;\n'
+            '        fn MapWindowPoints(from: HWND, to: HWND, points: *mut POINT, count: UINT) -> i32;\n'
+            '        fn ClientToScreen(hWnd: HWND, point: *mut POINT) -> BOOL;\n'
+            '        fn GetWindowRect(hWnd: HWND, rect: *mut RECT) -> BOOL;\n'
+            '        fn SetThreadDpiAwarenessContext(context: isize) -> isize;',
+            1, 'Add Win32 physical-DPI API declarations')
+
+        lib = replace_exact(
+            lib,
+            '    pub type HWND = *mut c_void;',
+            '    pub type HWND = *mut c_void;\n'
+            '    #[repr(C)]\n'
+            '    struct POINT { x: i32, y: i32 }',
+            1, 'Add Win32 POINT')
+
+        marker = '    const SWP_SHOWWINDOW: UINT = 0x0040;'
+        helper = '''    // Scope each Win32 geometry operation to per-monitor-v2 DPI awareness.
+            // GetSystemMetrics and SetWindowPos must use the same (physical) units.
+            struct PhysicalDpiGuard(isize);
+            impl Drop for PhysicalDpiGuard {
+                fn drop(&mut self) {
+                    if self.0 != 0 { unsafe { SetThreadDpiAwarenessContext(self.0); } }
+                }
+            }
+            fn physical_dpi_scope() -> PhysicalDpiGuard {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+                let previous = unsafe { SetThreadDpiAwarenessContext(-4) };
+                if previous == 0 {
+                    eprintln!("[DeskZero-V5] WARNING: Could not select per-monitor V2 DPI context");
+                }
+                PhysicalDpiGuard(previous)
+            }
+            fn place_physical_virtual_desktop(hwnd: isize, screen_x: i32, screen_y: i32, width: i32, height: i32) {
+                unsafe {
+                    // GetParent can return NULL for a reparented window that lacks
+                    // WS_CHILD; GA_PARENT exposes the actual desktop hierarchy.
+                    let parent = GetAncestor(hwnd as HWND, 1); // GA_PARENT
+                    if parent.is_null() {
+                        eprintln!("[DeskZero-V5] ERROR: No desktop parent; skip placement");
+                        return;
+                    }
+                    // Transform the intended screen-space origin to parent client coordinates
+                    // within the same per-monitor DPI awareness context.
+                    let mut origin = POINT { x: screen_x, y: screen_y };
+                    MapWindowPoints(std::ptr::null_mut(), parent, &mut origin, 1);
+                    let x = origin.x;
+                    let y = origin.y;
+                    let flags: UINT = 0x0004 | 0x0010 | 0x0020;
+                    let ok = SetWindowPos(hwnd as HWND, std::ptr::null_mut(), x, y, width, height, flags);
+                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    let read_ok = GetWindowRect(hwnd as HWND, &mut rect);
+                    eprintln!("[DeskZero-V5] placed={} read={} virtual=({},{},{},{}) actual=({},{},{},{}) parent=({},{})",
+                        ok, read_ok, screen_x, screen_y, width, height,
+                        rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                        x, y);
+                }
+            }
+        '''
+        lib = replace_exact(lib, marker, helper + marker, 1, 'Insert physical-DPI placement helper')
+
+        # Make the reparented window a real child before SetParent.
+        # SetParent alone does not change WS_CHILD/WS_POPUP (per Win32 docs).
+        target = '            SetParent(hwnd as HWND, target_parent);'
+        replacement = ('''            let _embed_dpi_guard = physical_dpi_scope();
+                      let gwl_style: i32 = -16;
+                      let ws_child: isize = 0x40000000;
+                      let ws_popup: isize = 0x80000000_u32 as isize;
+                      let current_style = get_window_long(hwnd as HWND, gwl_style);
+                      set_window_long(hwnd as HWND, gwl_style, (current_style | ws_child) & !ws_popup);
+                      SetParent(hwnd as HWND, target_parent);''')
+        lib = replace_exact(lib, target, replacement, 1, 'Set WS_CHILD before SetParent')
+
+        # Both existing placement methods obtain GetSystemMetrics; scope these calls
+        # to per-monitor-v2 DPI awareness before any metrics or child positioning.
+        metric_header = '            // 获取整个虚拟屏幕尺寸'
+        lib = replace_exact(lib, metric_header,
+            '            let _dpi_guard = physical_dpi_scope();\n' + metric_header,
+            1, 'Scope fix_window_after_embed DPI')
+        style_header = '            let sm_cxvirtualscreen = 78;'
+        # Exact marker occurs in both functions; style function only gets its own guard.
+        match = re.search(r'(pub fn fix_window_styles\(hwnd: isize\) \{\s*unsafe \{)', lib)
+        if not match:
+            raise SystemExit('Patch aborted: cannot locate fix_window_styles')
+        lib = lib[:match.end()] + '\n            let _dpi_guard = physical_dpi_scope();' + lib[match.end():]
+        print('Scope fix_window_styles DPI: 1 match')
+
+        call_pattern = (
+            r'SetWindowPos\(\s*hwnd as HWND,\s*'
+            r'(?:0 as HWND|HWND_TOP as HWND),\s*'
+            r'v_x,\s*v_y,\s*v_width,\s*v_height,\s*'
+            r'(?:0x0020,\s*(?://[^\n]*\n\s*)?|swp_framechanged,\s*)'
+            r'\);'
+        )
+        lib, matches = re.subn(call_pattern,
+            'place_physical_virtual_desktop(hwnd, v_x, v_y, v_width, v_height);', lib)
+        print(f'Replace both virtual desktop placement calls: {matches} matches')
+        if matches != 2:
+            raise SystemExit('Patch aborted: expected 2 placement calls')
+
+        # The existing scanner divides each monitor's absolute origin by its
+        # OWN DPI factor. This incorrectly mixes two coordinate spaces.
+        # For the user's 100%-scaled primary monitor, WebView CSS px = physical px.
+        # Return physical x/y/width/height for ALL monitors, retaining scale_factor
+        # separately for monitor-aware UI scaling.
+        conversion = ('        // 将物理像素转换为逻辑像素（CSS 像素），与浏览器坐标系一致\n'
+                      '        let to_logical = |v: i32| (v as f64 / scale_factor).round() as i32;\n'
+                      '        let to_logical_u = |v: i32| (v as f64 / scale_factor).round() as u32;')
+        replacement = ('        // Mixed-DPI V5: monitor coordinates must share one physical reference frame.\n'
+                       '        // The frontend may still require a separate physical-to-CSS conversion.\n'
+                       '        // DO NOT divide each monitor origin by its individual DPI factor.\n'
+                       '        let to_logical = |v: i32| v;\n'
+                       '        let to_logical_u = |v: i32| v as u32;')
+        scan = replace_exact(scan, conversion, replacement, 1, 'Unify scanner coordinates')
+
+        # Request physical monitor bounds during EnumDisplayMonitors/GetMonitorInfo.
+        scan = replace_exact(scan,
+            '        pub fn GetDpiForMonitor(',
+            '        pub fn SetThreadDpiAwarenessContext(context: isize) -> isize;\n'
+            '        pub fn GetDpiForMonitor(', 1, 'Declare scanner DPI context')
+        scan = replace_exact(scan,
+            '    let result = unsafe {\n        winapi::EnumDisplayMonitors(',
+            '    // Scope enumeration so GetMonitorInfo returns physical coordinates.\n'
+            '    let old_dpi_context = unsafe { winapi::SetThreadDpiAwarenessContext(-4) };\n'
+            '    let result = unsafe {\n        winapi::EnumDisplayMonitors(', 1, 'Scope monitor enumeration DPI')
+        scan = replace_exact(scan,
+            '    if result == 0 {\n        return Err("EnumDisplayMonitors 失败".to_string());',
+            '    if old_dpi_context != 0 {\n'
+            '        unsafe { winapi::SetThreadDpiAwarenessContext(old_dpi_context); }\n'
+            '    }\n'
+            '    if result == 0 {\n        return Err("EnumDisplayMonitors 失败".to_string());',
+            1, 'Restore scanner DPI context')
+
+        lib_path.write_text(lib, encoding='utf-8')
+        scan_path.write_text(scan, encoding='utf-8')
+        print('Mixed-DPI V5 patch applied successfully.')
+        '@ | Set-Content "$env:RUNNER_TEMP\deskzero_v5_patch.py" -Encoding utf8
+        python "$env:RUNNER_TEMP\deskzero_v5_patch.py"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        git diff -- src-tauri/src/lib.rs src-tauri/src/desktop/monitor_scanner.rs
+
+    - name: V6 - Convert physical monitor data to WebView CSS coordinates
+      shell: pwsh
+      run: |
+        @'
+        from pathlib import Path
+        import re
+
+        path = Path("src/stores/monitorStore.ts")
+        source = path.read_text(encoding="utf-8")
+
+        anchor = "export const useMonitorStore = create<MonitorState>((set, get) => ({"
+        if source.count(anchor) != 1:
+            raise SystemExit("V6 aborted: monitorStore structure has changed.")
+
+        helper = """// V6: Rust provides physical monitor coordinates, while pointer events and
+        // React layout positions are expressed in the current WebView's CSS pixels.
+        // Map every monitor through ONE shared virtual-desktop -> viewport transform.
+        function toDesktopCssCoordinates(rawMonitors: Monitor[]): Monitor[] {
+            if (rawMonitors.length === 0) return [];
+            const minX = Math.min(...rawMonitors.map((m) => m.x));
+            const minY = Math.min(...rawMonitors.map((m) => m.y));
+            const maxX = Math.max(...rawMonitors.map((m) => m.x + m.width));
+            const maxY = Math.max(...rawMonitors.map((m) => m.y + m.height));
+            const physicalWidth = maxX - minX;
+            const physicalHeight = maxY - minY;
+
+            // V5 places the WebView across the entire physical virtual desktop.
+            // The WebView viewport, however, uses CSS pixels (e.g. /1.25 on this PC).
+            const primaryScale = rawMonitors.find((m) => m.isPrimary)?.scaleFactor || 1;
+            const isDesktopView = window.location.pathname === "/";
+            // Settings uses a separate, smaller WebView: never normalize to its width.
+            const xScale = isDesktopView && physicalWidth > 0
+                ? window.innerWidth / physicalWidth : 1 / primaryScale;
+            const yScale = isDesktopView && physicalHeight > 0
+                ? window.innerHeight / physicalHeight : 1 / primaryScale;
+
+            return rawMonitors.map((m) => ({
+                ...m,
+                x: (m.x - minX) * xScale,
+                y: (m.y - minY) * yScale,
+                width: m.width * xScale,
+                height: m.height * yScale,
+                workArea: {
+                    ...m.workArea,
+                    x: (m.workArea.x - minX) * xScale,
+                    y: (m.workArea.y - minY) * yScale,
+                    width: m.workArea.width * xScale,
+                    height: m.workArea.height * yScale,
+                },
+            }));
+        }
+
+        """
+        source = source.replace(anchor, helper + anchor)
+
+        pattern = re.compile(
+            r"(?m)^(?P<indent>[ \t]*)const rawMonitors = await "
+            r"(?P<fn>getMonitors|refreshMonitors)\(\);"
+            r"(?P<old>.*?)"
+            r"^(?P=indent)set\(\{ monitors, isLoading: false \}\);",
+            re.S | re.M,
+        )
+        def convert(match):
+            indent = match.group("indent")
+            fn = match.group("fn")
+            old = match.group("old")
+            if "const minX" not in old or "const minY" not in old or "rawMonitors.map" not in old:
+                raise SystemExit("V6 aborted: unexpected monitor conversion block.")
+            return (
+                f"{indent}const rawMonitors = await {fn}();\n"
+                f"{indent}const monitors = toDesktopCssCoordinates(rawMonitors);\n"
+                f"{indent}set({{ monitors, isLoading: false }});"
+            )
+
+        source, count = pattern.subn(convert, source)
+        if count != 2:
+            raise SystemExit(f"V6 aborted: expected 2 monitor fetch/refresh blocks; found {count}.")
+        if source.count("toDesktopCssCoordinates(rawMonitors)") != 2:
+            raise SystemExit("V6 aborted: both monitor conversion call sites must be updated.")
+
+        path.write_text(source, encoding="utf-8")
+        print("V6 frontend patch applied: 2 monitor conversion call sites.")
+        print("Expected current display (CSS pixels): secondary x=0..1536; primary x=1536..3584")
+        '@ | Set-Content "$env:RUNNER_TEMP\deskzero_v6_frontend.py" -Encoding utf8
+
+        python "$env:RUNNER_TEMP\deskzero_v6_frontend.py"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        git diff --stat
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: npm
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+    - name: Install frontend dependencies
+      run: npm ci
+    - name: Sync application version
+      run: node scripts/sync-config.js
+    - name: Build Windows executable
+      run: npm run tauri build -- --no-bundle
+    - name: Upload executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeskZero-Mixed-DPI-V6-Windows-x64
+        path: src-tauri/target/release/deskzero.exe
+        if-no-files-found: error
+        retention-days: 14
